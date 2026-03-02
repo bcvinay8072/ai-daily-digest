@@ -155,6 +155,73 @@ def save_sent_ids(ids: set):
 # -----------------------------------------------------------
 # Main orchestration
 # -----------------------------------------------------------
+
+TEMPLATE_STR = """
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body {font-family:Arial,Helvetica,sans-serif;margin:0;padding:20px;}
+    h2 {color:#0d6efd;}
+    .section {margin-top:30px;}
+    .item {margin-bottom:18px;}
+    .title {font-weight:bold;color:#0d6efd;text-decoration:none;}
+    .meta {font-size:0.85em;color:#555;margin-top:2px;}
+    .summary {margin-top:4px;}
+    .img {max-width:100%;height:auto;margin-top:5px;}
+  </style>
+</head>
+<body>
+  <h2>{{ intro_line }}</h2>
+
+  <!-- Top 3 stories -->
+  <div class="section">
+    <h3>🏆 Top stories</h3>
+    {% for it in top_items %}
+      <div class="item">
+        <a class="title" href="{{ it.link }}" target="_blank">{{ it.title }}</a>
+        <div class="meta">{{ it.published[:10] if it.published else '' }} • {{ it.source|capitalize }}</div>
+        {% if it.llm_summary %}
+          <div class="summary">{{ it.llm_summary }}</div>
+        {% elif it.summary %}
+          <div class="summary">{{ it.summary }}</div>
+        {% endif %}
+        {% if it.image_url and INCLUDE_IMAGES %}
+          <img class="img" src="{{ it.image_url }}" alt="">
+        {% endif %}
+      </div>
+    {% endfor %}
+  </div>
+
+  <!-- Rest, grouped by source -->
+  {% for src, items in sections.items() %}
+    <div class="section">
+      <h3>📚 {{ src|capitalize }}</h3>
+      {% for it in items %}
+        <div class="item">
+          <a class="title" href="{{ it.link }}" target="_blank">{{ it.title }}</a>
+          <div class="meta">{{ it.published[:10] if it.published else '' }}</div>
+          {% if it.llm_summary %}
+            <div class="summary">{{ it.llm_summary }}</div>
+          {% elif it.summary %}
+            <div class="summary">{{ it.summary }}</div>
+          {% endif %}
+          {% if it.image_url and INCLUDE_IMAGES %}
+            <img class="img" src="{{ it.image_url }}" alt="">
+          {% endif %}
+        </div>
+      {% endfor %}
+    </div>
+  {% endfor %}
+
+  <p style="font-size:0.8em;color:#888;">
+    You are receiving this because you subscribed to the AI‑news‑bot.
+    To stop, delete the repository or remove the GitHub Secrets.
+  </p>
+</body>
+</html>
+"""
+
 def main():
     # 1️⃣ Gather everything
     all_items = []
