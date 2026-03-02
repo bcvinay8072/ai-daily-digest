@@ -2,4 +2,5 @@ feedparser
 jinja2
 python-dotenv
 requests
+beautifulsoup4
 openai
