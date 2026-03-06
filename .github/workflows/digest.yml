@@ -9,6 +9,8 @@ on:
         description: "Dump generated HTML to the Action log"
         required: false
         default: "false"
+permissions:
+  contents: write
 
 jobs:
   build-and-send:
