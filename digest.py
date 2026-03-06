@@ -35,18 +35,19 @@ NEWSAPI_POP_FACTOR = float(os.getenv("NEWSAPI_POP_FACTOR", "0.3"))
 # -----------------------------------------------------------------
 # SOURCE WEIGHTS – adjust to give more importance to preferred feeds
 # -----------------------------------------------------------------
-# The key must match the **source name** returned by the fetch() helper.
-# (source names are lower‑case, no spaces)
 SOURCE_WEIGHTS = {
-    "techcrunch": 2.0,
-    "verge":      1.5,
-    "arxiv":      2.5,
-    "hn":         0.8,
-    "reddit":     0.6,
-    "generic":    1.0,
+    "techcrunch":   2.0,
+    "verge":        1.5,
+    "arxiv":        2.5,
+    "hn":           0.8,
+    "reddit":       0.6,
+    "techreview":   2.0,   # MIT Technology Review
+    "miri":         1.2,   # Machine Intelligence Research Institute
+    "aitrends":     1.5,   # AI Trends
+    "deeplearning": 2.0,   # DeepLearning.ai
+    "generic":      1.0,
 }
 # -----------------------------------------------------------------
-
 
 # -----------------------------------------------------------------
 # 1️⃣ FETCH ALL SOURCES
@@ -63,7 +64,7 @@ FEEDS = [
     "https://www.deeplearning.ai/feed/",
 
     # ----- Optional NewsAPI source (requires NEWS_API_KEY) -----
-    # If you have a NewsAPI key, uncomment the line below and add the secret.
+    # Uncomment if you have a NewsAPI key:
     # f"https://newsapi.org/v2/everything?"
     # f"q=artificial+intelligence&language=en&sortBy=publishedAt&"
     # f"pageSize=30&apiKey={os.getenv('NEWS_API_KEY','')}"
@@ -71,17 +72,14 @@ FEEDS = [
 
 def _infer_source_name(url: str) -> str:
     """Map a feed URL to the short source name used in SOURCE_WEIGHTS."""
-    if "techcrunch.com" in url:
-        return "techcrunch"
-    if "theverge.com" in url:
-        return "verge"
-    if "arxiv.org" in url:
-        return "arxiv"
-    if "hnrss.org" in url:
-        return "hn"
-    if "newsapi.org" in url:
-        return "newsapi"
-    # generic fallback
+    if "techcrunch.com"      in url: return "techcrunch"
+    if "theverge.com"        in url: return "verge"
+    if "arxiv.org"          in url: return "arxiv"
+    if "hnrss.org"           in url: return "hn"
+    if "technologyreview.com" in url: return "techreview"
+    if "intelligence.org"    in url: return "miri"
+    if "aitrends.com"        in url: return "aitrends"
+    if "deeplearning.ai"    in url: return "deeplearning"
     return "generic"
 
 
