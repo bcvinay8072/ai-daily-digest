@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -----------------------------------------------------------------
-# Weekly AI Digest – fetch, filter, score, format, email
+# Weekly AI Digest – OpenAI Agents SDK version
+# Two-agent pipeline: Researcher (WebSearchTool) → Curator (LLM)
 # -----------------------------------------------------------------
 import os
 import json
@@ -9,156 +10,133 @@ import datetime
 import ssl
 import smtplib
 
-import feedparser           # RSS/Atom parser
-import requests             # HTTP client
-import bs4                  # BeautifulSoup for OG images
-import openai               # OpenAI >= 1.0 (works with proxy URLs)
-from email.mime.multipart import MIMEMultipart   # <-- needed for the e‑mail
+from pydantic import BaseModel, Field
+from agents import Agent, Runner, WebSearchTool
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from jinja2 import Template
 from dotenv import load_dotenv
 
-# -------------------------------------------------------------
-# Load .env (non‑secret configuration)
-# -------------------------------------------------------------
-load_dotenv()   # reads a .env file in the repo root (if present)
+# -----------------------------------------------------------------
+# Load .env (non-secret configuration)
+# -----------------------------------------------------------------
+load_dotenv()
 
-# -------------------- USER‑CONFIGURABLE OPTIONS --------------------
-MAX_ITEMS          = int(os.getenv("MAX_ITEMS", "20"))          # how many items in the weekly mail
-MAX_AGE_DAYS       = int(os.getenv("MAX_AGE_DAYS", "7"))        # keep only items newer than this
-KEYWORDS           = [k.strip().lower()
-                      for k in os.getenv("KEYWORDS", "").split(",")
-                      if k]                                   # e.g. llm,gpt,reinforcement
-INCLUDE_IMAGES    = os.getenv("INCLUDE_IMAGES", "true").lower() == "true"
-DEBUG_MODE        = os.getenv("DEBUG_MODE", "false").lower() == "true"
-NEWSAPI_POP_FACTOR = float(os.getenv("NEWSAPI_POP_FACTOR", "0.3"))
+# -------------------- CONFIGURABLE OPTIONS -----------------------
+MAX_ITEMS    = int(os.getenv("MAX_ITEMS", "5"))
+MAX_AGE_DAYS = int(os.getenv("MAX_AGE_DAYS", "7"))
+DEBUG_MODE   = os.getenv("DEBUG_MODE", "false").lower() == "true"
 # -----------------------------------------------------------------
 
-# -----------------------------------------------------------------
-# SOURCE WEIGHTS – you can also override any of these via .env
-# -----------------------------------------------------------------
-SOURCE_WEIGHTS = {
-    "techcrunch":   2.0,
-    "verge":        1.5,
-    "arxiv":        2.5,
-    "hn":           0.8,
-    "reddit":       0.6,
-    "techreview":   2.0,   # MIT Technology Review
-    "miri":         1.2,   # Machine Intelligence Research Institute
-    "aitrends":     1.5,   # AI Trends
-    "deeplearning": 2.0,   # DeepLearning.ai
-    "generic":      1.0,
-}
-# -------------------------------------------------------------
+# =================================================================
+# STRUCTURED OUTPUT SCHEMAS (Pydantic)
+# =================================================================
 
-# -----------------------------------------------------------------
-# 1️⃣ FETCH ALL SOURCES (including the new ones you added)
-# -----------------------------------------------------------------
-FEEDS = [
-    # ----- Free RSS feeds (feel free to add more) -----
-    "https://techcrunch.com/tag/artificial-intelligence/feed/",
-    "https://www.theverge.com/artificial-intelligence/rss/index.xml",
-    "https://export.arxiv.org/rss/cs.AI",
-    "https://hnrss.org/show",
-    "https://www.technologyreview.com/feed/tag/artificial-intelligence/",
-    "https://intelligence.org/feed/",
-    "https://www.aitrends.com/feed/",
-    "https://www.deeplearning.ai/feed/",
+class ResearchItem(BaseModel):
+    """A single news item found by the Researcher agent."""
+    title: str = Field(description="Headline of the news item")
+    url: str = Field(description="Direct URL to the article or announcement")
+    source: str = Field(description="Publication or platform name (e.g. 'TechCrunch', 'GitHub', 'arXiv')")
+    one_liner: str = Field(description="One-sentence factual summary of the news (max 20 words)")
 
-    # ----- Optional NewsAPI source (requires NEWS_API_KEY) -----
-    # Uncomment if you have a NewsAPI key:
-    # f"https://newsapi.org/v2/everything?"
-    # f"q=artificial+intelligence&language=en&sortBy=publishedAt&"
-    # f"pageSize=30&apiKey={os.getenv('NEWS_API_KEY','')}"
-]
 
-def _infer_source_name(url: str) -> str:
-    """Map a feed URL to the short source name used in SOURCE_WEIGHTS."""
-    if "techcrunch.com"      in url: return "techcrunch"
-    if "theverge.com"        in url: return "verge"
-    if "arxiv.org"           in url: return "arxiv"
-    if "hnrss.org"           in url: return "hn"
-    if "technologyreview.com" in url: return "techreview"
-    if "intelligence.org"    in url: return "miri"
-    if "aitrends.com"        in url: return "aitrends"
-    if "deeplearning.ai"    in url: return "deeplearning"
-    return "generic"
+class ResearchResult(BaseModel):
+    """The full output from the Researcher agent."""
+    items: list[ResearchItem] = Field(
+        description="List of 12-15 AI news items found from the past week"
+    )
 
-def fetch(src: str):
-    """Return a list of dictionaries for a given source."""
-    source_name = _infer_source_name(src)
 
-    # ----- NewsAPI (JSON) -------------------------------------------------
-    if "newsapi.org" in src:
-        resp = requests.get(src, timeout=10)
-        data = resp.json()
-        items = []
-        for a in data.get("articles", []):
-            items.append({
-                "title": a.get("title", ""),
-                "link": a.get("url", ""),
-                "published": a.get("publishedAt", ""),
-                "summary": a.get("description", ""),
-                "source": source_name,
-                "popularity": a.get("popularity", 0)
-            })
-        return items
+class DigestItem(BaseModel):
+    """A single curated item for the final email digest."""
+    title: str = Field(description="Clean, concise headline")
+    url: str = Field(description="Direct URL to the article or announcement")
+    source: str = Field(description="Publication or platform name")
+    summary: str = Field(description="2-3 sentence summary: what happened and why it matters for an early-career AI engineer")
+    quick_take: str = Field(description="One actionable sentence starting with an emoji — what the reader should do or know")
 
-    # ----- RSS / Atom ----------------------------------------------------
-    d = feedparser.parse(src)
-    out = []
-    for e in d.entries:
-        out.append({
-            "title": e.title,
-            "link": e.link,
-            "published": getattr(e, "published", ""),
-            "summary": getattr(e, "summary", ""),
-            "source": source_name,
-        })
-    return out
 
-# -----------------------------------------------------------------
-# 2️⃣ AGE FILTER – drop anything older than MAX_AGE_DAYS
-# -----------------------------------------------------------------
-def _iso_to_ts(iso: str) -> float:
-    """Convert ISO‑8601 (or RFC‑822) to a Unix timestamp; 0 on failure."""
-    if not iso:
-        return 0.0
-    try:
-        return datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
-    except Exception:
-        try:
-            parsed = feedparser._parse_date(iso)   # internal helper for RFC‑822
-            return parsed.timestamp()
-        except Exception:
-            return 0.0
+class DigestResult(BaseModel):
+    """The full output from the Curator agent."""
+    week_tldr: str = Field(description="One sentence summarizing the entire week in AI (max 25 words)")
+    items: list[DigestItem] = Field(description=f"Top {MAX_ITEMS} curated items, ranked by importance")
 
-def is_too_old(published_str: str) -> bool:
-    """True if the article is older than MAX_AGE_DAYS."""
-    if not published_str:
-        return False
-    ts = _iso_to_ts(published_str)
-    if ts == 0.0:
-        return False
-    age_days = (datetime.datetime.now(datetime.timezone.utc).timestamp() - ts) / 86400
-    return age_days > MAX_AGE_DAYS
 
-# -----------------------------------------------------------------
-# 3️⃣ DEDUPLICATION – keep only newest copy of the same URL
-# -----------------------------------------------------------------
-def dedupe(items):
-    """Deduplicate by URL; keep the newest version if duplicated."""
-    seen = {}
-    for it in items:
-        h = hashlib.sha256(it["link"].encode()).hexdigest()
-        if (h not in seen) or (it.get("published", "") > seen[h].get("published", "")):
-            seen[h] = it
-    return list(seen.values())
+# =================================================================
+# AGENT DEFINITIONS
+# =================================================================
 
-# -----------------------------------------------------------------
-# 4️⃣ SENT‑IDS PERSISTENCE (cross‑run duplicate avoidance)
-# -----------------------------------------------------------------
+today_str = datetime.date.today().isoformat()
+week_ago = (datetime.date.today() - datetime.timedelta(days=MAX_AGE_DAYS)).isoformat()
+
+researcher_agent = Agent(
+    name="AI News Researcher",
+    instructions=f"""You are an AI news researcher. Your job is to find the most important
+AI developments from the past week ({week_ago} to {today_str}).
+
+Search for news across these categories:
+1. **New LLM releases & updates** — new models, benchmarks, capabilities
+2. **Open-source tools & frameworks** — new libraries, major releases, useful dev tools
+3. **Major industry moves** — acquisitions, partnerships, policy changes that matter
+4. **Research breakthroughs** — important papers, new techniques
+
+Search strategy:
+- Run multiple searches covering different angles (e.g. "new LLM release this week",
+  "open source AI tools November 2026", "AI research breakthroughs this week")
+- Focus on REAL, SPECIFIC news — not evergreen articles or listicles
+- Prefer primary sources (official blogs, GitHub repos, arXiv) over secondary coverage
+- Find 12-15 items so the Curator has enough to choose from
+- Every item MUST have a real, working URL
+
+Do NOT include:
+- Opinion pieces or editorials
+- "What is AI?" style explainers
+- News older than {MAX_AGE_DAYS} days
+- Duplicate stories (same news from different outlets — pick the best source)""",
+    tools=[WebSearchTool(search_context_size="high")],
+    output_type=ResearchResult,
+    model="gpt-4o-mini",
+)
+
+curator_agent = Agent(
+    name="AI Digest Curator",
+    instructions=f"""You are an AI digest curator writing for an early-career AI/ML engineer.
+
+You will receive a list of AI news items found by a researcher. Your job:
+
+1. **Select the top {MAX_ITEMS} most important items** — prioritize:
+   - New LLM releases (GPT, Claude, Gemini, Llama, Mistral, open-weight models)
+   - Genuinely useful open-source tools and frameworks
+   - Breakthroughs that change how people build with AI
+   - Things an early-career engineer should know about to stay competitive
+
+2. **Write a crisp summary** for each (2-3 sentences):
+   - What happened (factual)
+   - Why it matters for someone starting their AI career
+   - Keep it jargon-free; explain technical terms briefly if needed
+
+3. **Add a Quick Take** for each — one actionable sentence:
+   - Start with a relevant emoji
+   - Tell the reader what to DO: try it, read the paper, watch the demo, bookmark it
+   - Example: "🔧 Try it out — pip install and build your first agent in 10 minutes"
+
+4. **Write a week_tldr** — one sentence capturing the week's biggest theme
+
+IMPORTANT:
+- Be concise. No fluff, no hype.
+- If an item isn't genuinely useful to an early-career engineer, drop it.
+- Rank by importance (most important first).
+- Preserve the exact URLs from the research — do NOT modify or make up URLs.""",
+    output_type=DigestResult,
+    model="gpt-4o-mini",
+)
+
+# =================================================================
+# SENT-IDS PERSISTENCE (cross-run dedup)
+# =================================================================
 SENT_IDS_PATH = "sent_ids.json"
+MAX_SENT_IDS = 2000  # auto-prune to prevent unbounded growth
+
 
 def load_sent_ids() -> set:
     """Return a set of URLs that have already been mailed."""
@@ -169,228 +147,171 @@ def load_sent_ids() -> set:
     except Exception:
         return set()
 
+
 def save_sent_ids(ids: set):
-    """Write the set of URLs back to sent_ids.json."""
-    json.dump(list(ids), open(SENT_IDS_PATH, "w"))
+    """Write the set of URLs back to sent_ids.json, pruning if needed."""
+    id_list = list(ids)
+    # Keep only the most recent MAX_SENT_IDS entries
+    if len(id_list) > MAX_SENT_IDS:
+        id_list = id_list[-MAX_SENT_IDS:]
+    json.dump(id_list, open(SENT_IDS_PATH, "w"))
 
-# -----------------------------------------------------------------
-# 5️⃣ ONE‑SENTENCE LLM TEASER (OpenAI ≥ 1.0)
-# -----------------------------------------------------------------
-def summarize_openai_short(text: str) -> str:
-    """
-    Ask OpenAI (gpt‑4o‑mini) for a single‑sentence summary.
-    Works with a normal OpenAI key *or* with a proxy (AIPipe, Azure, etc.).
-    """
-    # Optional proxy base‑url – required for AIPipe, Azure, etc.
-    base_url = os.getenv("OPENAI_BASE_URL")   # e.g. https://api.mykit.ai/v1
-    client = openai.OpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        base_url=base_url   # None is fine → defaults to api.openai.com
-    )
-    prompt = (
-        "Summarise the following article in a single concise sentence "
-        "(max 25 words, no jargon). Return only the sentence.\n\n"
-        + text
-    )
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=60,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        # Keep the pipeline alive – just log the error and continue.
-        print("🔺 OpenAI error:", e)
-        return ""
 
-# -----------------------------------------------------------------
-# 6️⃣ OPTIONAL – FETCH OPEN‑GRAPH IMAGE
-# -----------------------------------------------------------------
-def fetch_og_image(url: str) -> str | None:
-    """Return the first og:image URL from the page, or None."""
-    try:
-        resp = requests.get(
-            url,
-            timeout=5,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        if resp.status_code != 200:
-            return None
-        soup = bs4.BeautifulSoup(resp.text, "html.parser")
-        meta = soup.find("meta", property="og:image")
-        if meta and meta.get("content"):
-            return meta["content"]
-    except Exception:
-        pass
-    return None
-
-# -----------------------------------------------------------------
-# 7️⃣ SCORING – source weight + recency + popularity + keyword boost
-# -----------------------------------------------------------------
-def compute_score(item: dict) -> float:
-    # ----- source weight -------------------------------------------------
-    base = SOURCE_WEIGHTS.get(item.get("source", "generic").lower(), 1.0)
-
-    # ----- recency (newer = higher) --------------------------------------
-    now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
-    pub_ts = _iso_to_ts(item.get("published", ""))
-    if pub_ts == 0.0:
-        recency = 0.4                     # unknown date → modest boost
-    else:
-        age_days = (now_ts - pub_ts) / 86400
-        recency = max(0.1, 1.0 / (1.0 + age_days))   # 1‑day ≈0.5, 7‑day ≈0.13
-
-    # ----- popularity (NewsAPI only) ------------------------------------
-    pop_bonus = float(item.get("popularity", 0)) * NEWSAPI_POP_FACTOR
-
-    # ----- keyword boost -------------------------------------------------
-    txt = f"{item.get('title','')} {item.get('summary','')}".lower()
-    kw_bonus = 0.5 if any(kw in txt for kw in KEYWORDS) else 0.0
-
-    # ----- final weighted sum (feel free to tune) -----------------------
-    score = (base * 1.0) + (recency * 4.0) + pop_bonus + kw_bonus
-    return score
-
-# -----------------------------------------------------------------
-# 8️⃣ HTML TEMPLATE (Jinja2)
-# -----------------------------------------------------------------
-TEMPLATE_STR = """
+# =================================================================
+# HTML EMAIL TEMPLATE
+# =================================================================
+TEMPLATE_STR = """\
 <html>
 <head>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    body {font-family:Arial,Helvetica,sans-serif;margin:0;padding:20px;background:#fafafa;}
-    h2 {color:#0d6efd;}
-    .section {margin-top:30px;}
-    .item {margin-bottom:18px;padding:10px;background:#fff;border-radius:4px;
-           box-shadow:0 1px 3px rgba(0,0,0,0.1);}
-    .title {font-weight:bold;color:#0d6efd;text-decoration:none;}
-    .meta {font-size:0.85em;color:#555;margin-top:2px;}
-    .summary {margin-top:5px;color:#333;}
-    blockquote {border-left:3px solid #ddd;margin:8px 0;padding-left:10px;
-                color:#555;font-style:italic;}
-    .img {max-width:100%;height:auto;margin-top:5px;border-radius:4px;}
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      margin: 0; padding: 0; background: #f4f4f5;
+    }
+    .container {
+      max-width: 600px; margin: 0 auto; padding: 24px 16px;
+    }
+    .header {
+      background: linear-gradient(135deg, #1e3a5f 0%, #0d6efd 100%);
+      color: white; padding: 24px; border-radius: 12px 12px 0 0;
+      text-align: center;
+    }
+    .header h1 { margin: 0; font-size: 22px; }
+    .header .date { font-size: 13px; opacity: 0.85; margin-top: 4px; }
+    .tldr {
+      background: #e8f0fe; padding: 14px 18px; border-radius: 0 0 12px 12px;
+      font-size: 15px; color: #1a1a1a; line-height: 1.5;
+      border-left: 4px solid #0d6efd; margin-bottom: 20px;
+    }
+    .tldr strong { color: #0d6efd; }
+    .item {
+      background: white; border-radius: 10px; padding: 16px 18px;
+      margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    }
+    .item-number {
+      display: inline-block; background: #0d6efd; color: white;
+      width: 24px; height: 24px; border-radius: 50%; text-align: center;
+      line-height: 24px; font-size: 13px; font-weight: bold; margin-right: 8px;
+    }
+    .item-title {
+      font-weight: 600; font-size: 16px; color: #1a1a1a;
+      text-decoration: none;
+    }
+    .item-title:hover { color: #0d6efd; }
+    .item-source {
+      font-size: 12px; color: #888; margin-top: 3px;
+    }
+    .item-summary {
+      font-size: 14px; color: #333; line-height: 1.55; margin-top: 8px;
+    }
+    .quick-take {
+      font-size: 13px; color: #0d6efd; margin-top: 8px;
+      padding: 8px 12px; background: #f0f7ff; border-radius: 6px;
+      font-weight: 500;
+    }
+    .footer {
+      text-align: center; font-size: 12px; color: #999;
+      margin-top: 20px; padding: 12px;
+    }
   </style>
 </head>
 <body>
-  <h2>{{ intro_line }}</h2>
-
-  <!-- Top 3 stories -->
-  <div class="section">
-    <h3>🏆 Top stories</h3>
-    {% for it in top_items %}
-      <div class="item">
-        <a class="title" href="{{ it.link }}" target="_blank">{{ it.title }}</a>
-        <div class="meta">{{ it.published[:10] if it.published else '' }} • {{ it.source|capitalize }}</div>
-        {% if it.llm_summary %}
-          <div class="summary">{{ it.llm_summary }}</div>
-        {% elif it.summary %}
-          <div class="summary">{{ it.summary }}</div>
-        {% endif %}
-        {% if it.image_url and INCLUDE_IMAGES %}
-          <img class="img" src="{{ it.image_url }}" alt="">
-        {% endif %}
-      </div>
-    {% endfor %}
-  </div>
-
-  <!-- Other sources grouped by source name -->
-  {% for src, items in sections.items() %}
-    <div class="section">
-      <h3>📚 {{ src|capitalize }}</h3>
-      {% for it in items %}
-        <div class="item">
-          <a class="title" href="{{ it.link }}" target="_blank">{{ it.title }}</a>
-          <div class="meta">{{ it.published[:10] if it.published else '' }}</div>
-          {% if it.llm_summary %}
-            <div class="summary">{{ it.llm_summary }}</div>
-          {% elif it.summary %}
-            <div class="summary">{{ it.summary }}</div>
-          {% endif %}
-          {% if it.image_url and INCLUDE_IMAGES %}
-            <img class="img" src="{{ it.image_url }}" alt="">
-          {% endif %}
-        </div>
-      {% endfor %}
+  <div class="container">
+    <div class="header">
+      <h1>🗞️ Weekly AI Digest</h1>
+      <div class="date">{{ date }} · Top {{ items|length }} stories</div>
     </div>
-  {% endfor %}
 
-  <p style="font-size:0.8em;color:#888;">
-    You are receiving this because you subscribed to the AI‑Digest runner.
-    To stop, delete the repository or remove the GitHub Secrets.
-  </p>
+    <div class="tldr">
+      <strong>TL;DR:</strong> {{ week_tldr }}
+    </div>
+
+    {% for it in items %}
+    <div class="item">
+      <span class="item-number">{{ loop.index }}</span>
+      <a class="item-title" href="{{ it.url }}" target="_blank">{{ it.title }}</a>
+      <div class="item-source">{{ it.source }}</div>
+      <div class="item-summary">{{ it.summary }}</div>
+      <div class="quick-take">{{ it.quick_take }}</div>
+    </div>
+    {% endfor %}
+
+    <div class="footer">
+      You're receiving this because you subscribed to AI Digest.<br>
+      Powered by OpenAI Agents SDK · Built with ❤️
+    </div>
+  </div>
 </body>
 </html>
 """
 
-# -----------------------------------------------------------------
-# 9️⃣ MAIN – orchestrate everything
-# -----------------------------------------------------------------
+
+# =================================================================
+# MAIN PIPELINE
+# =================================================================
 def main():
-    # ----- 1️⃣ Fetch everything ----------
-    all_items = []
-    for src in FEEDS:
-        try:
-            all_items.extend(fetch(src))
-        except Exception as exc:
-            print(f"⚠️  fetch error {src}: {exc}")
+    print(f"📅 Running Weekly AI Digest for {today_str}")
+    print(f"   Looking back {MAX_AGE_DAYS} days, selecting top {MAX_ITEMS} items\n")
 
-    # ----- 2️⃣ Age filter ----------
-    fresh_items = [it for it in all_items if not is_too_old(it.get("published",""))]
-    print(f"🔎 {len(fresh_items)} items after age filter (max {MAX_AGE_DAYS} d)")
+    # ----- 1️⃣ Research: Agent searches the web -----
+    print("🔍 Step 1: Researcher agent searching the web...")
+    research_result = Runner.run_sync(
+        researcher_agent,
+        f"Find the most important AI news from {week_ago} to {today_str}. "
+        f"Focus on: new LLM releases, useful open-source tools & frameworks, "
+        f"and major breakthroughs. Find 12-15 items.",
+    )
+    raw_items: ResearchResult = research_result.final_output
+    print(f"   Found {len(raw_items.items)} items\n")
 
-    # ----- 3️⃣ Remove URLs already mailed ----------
+    if DEBUG_MODE:
+        print("   === DEBUG: Raw research items ===")
+        for item in raw_items.items:
+            print(f"   - {item.title} ({item.source})")
+        print()
+
+    # ----- 2️⃣ Dedup: remove already-sent URLs -----
     already_sent = load_sent_ids()
-    fresh_items = [it for it in fresh_items if it["link"] not in already_sent]
+    fresh_items = [it for it in raw_items.items if it.url not in already_sent]
+    print(f"🧹 Step 2: {len(fresh_items)} items after dedup ({len(raw_items.items) - len(fresh_items)} already sent)\n")
 
-    # ----- 4️⃣ Deduplicate inside this run ----------
-    fresh_items = dedupe(fresh_items)
+    if not fresh_items:
+        print("⚠️  No new items to send — skipping this week.")
+        return
 
-    # ----- 5️⃣ Score & keep top N ----------
-    for it in fresh_items:
-        it["score"] = compute_score(it)
-    chosen = sorted(fresh_items, key=lambda i: i["score"], reverse=True)[:MAX_ITEMS]
+    # ----- 3️⃣ Curate: Agent selects and writes summaries -----
+    print("✍️  Step 3: Curator agent writing digest...")
+    items_text = "\n".join(
+        f"- Title: {it.title}\n  URL: {it.url}\n  Source: {it.source}\n  Summary: {it.one_liner}"
+        for it in fresh_items
+    )
+    curate_result = Runner.run_sync(
+        curator_agent,
+        f"Here are the AI news items from this week. Select the top {MAX_ITEMS} "
+        f"and write the digest:\n\n{items_text}",
+    )
+    digest: DigestResult = curate_result.final_output
+    print(f"   Curated {len(digest.items)} items")
+    print(f"   TL;DR: {digest.week_tldr}\n")
 
-    # ----- 6️⃣ Optional LLM one‑sentence teaser ----------
-    if os.getenv("OPENAI_API_KEY"):
-        for it in chosen:
-            src_txt = it.get("summary","") or ""
-            it["llm_summary"] = summarize_openai_short(src_txt[:2000])
-
-    # ----- 7️⃣ Optional OG image ----------
-    if INCLUDE_IMAGES:
-        for it in chosen:
-            if not it.get("image_url"):
-                it["image_url"] = fetch_og_image(it["link"])
-
-    # ----- 8️⃣ Sectioning: top 3 + per‑source buckets ----------
-    top_items = chosen[:3]
-    sections = {}
-    for itm in chosen[3:]:
-        src = itm["source"]
-        sections.setdefault(src, []).append(itm)
-
-    # ----- 9️⃣ Build HTML ----------
-    today = datetime.date.today().isoformat()
-    intro = f"🗞️ Weekly AI Digest – {today} (last {MAX_AGE_DAYS} d)"
+    # ----- 4️⃣ Build HTML email -----
+    print("📧 Step 4: Building email...")
     html = Template(TEMPLATE_STR).render(
-        intro_line=intro,
-        top_items=top_items,
-        sections=sections,
-        INCLUDE_IMAGES=INCLUDE_IMAGES,
+        date=today_str,
+        week_tldr=digest.week_tldr,
+        items=[item.model_dump() for item in digest.items],
     )
 
-    # ----- 10️⃣ DEBUG: dump HTML to Action log if requested ----------
     if DEBUG_MODE:
         print("\n===== DEBUG: GENERATED HTML START =====\n")
         print(html)
         print("\n===== DEBUG: GENERATED HTML END =====\n")
 
-    # ----- 11️⃣ Send e‑mail via Gmail SMTP ----------
-    msg = MIMEMultipart("alternative")                # <-- now defined
-    msg["Subject"] = f"🗞️ Weekly AI Digest – {today}"
+    # ----- 5️⃣ Send email via Gmail SMTP -----
+    print("📬 Step 5: Sending email...")
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"🗞️ Weekly AI Digest – {today_str}"
     msg["From"]    = os.getenv("SMTP_EMAIL")
     msg["To"]      = os.getenv("RECIPIENT_EMAIL")
     msg.attach(MIMEText(html, "html"))
@@ -399,11 +320,12 @@ def main():
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
         server.login(os.getenv("SMTP_EMAIL"), os.getenv("SMTP_PASSWORD"))
         server.send_message(msg)
-    print("✅ Mail delivered")
+    print("✅ Mail delivered!\n")
 
-    # ----- 12️⃣ Update sent_ids.json (so next run skips these URLs) -----
-    new_ids = {it["link"] for it in chosen}
+    # ----- 6️⃣ Update sent_ids.json -----
+    new_ids = {item.url for item in digest.items}
     save_sent_ids(already_sent | new_ids)
+    print(f"💾 Updated sent_ids.json (+{len(new_ids)} URLs)")
 
 
 if __name__ == "__main__":
